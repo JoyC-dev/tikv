@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use encryption::{BackupEncryptionManager, EncrypterReader, Iv, MultiMasterKeyBackend};
 use encryption_export::create_async_backend;
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
-use external_storage::{create_storage, BackendConfig, ExternalStorage, UnpinReader};
+use external_storage::{create_storage, BackendConfig, ExternalStorage, HdfsConfig, UnpinReader};
 use file_system::Sha256Reader;
 use futures::io::Cursor;
 use kvproto::{
@@ -343,19 +343,24 @@ pub struct Config {
     pub temp_file_size_limit: u64,
     pub temp_file_memory_quota: u64,
     pub max_flush_interval: Duration,
+    pub s3_multi_part_size: usize,
+    pub gcp_v2_enable: bool,
 }
 
-impl From<BackupStreamConfig> for Config {
-    fn from(value: BackupStreamConfig) -> Self {
+impl Config {
+    pub fn from_backup_stream_config(value: BackupStreamConfig) -> Self {
         let prefix = PathBuf::from(value.temp_path);
         let temp_file_size_limit = value.file_size_limit.0;
         let temp_file_memory_quota = value.temp_file_memory_quota.0;
         let max_flush_interval = value.max_flush_interval.0;
+        let s3_multi_part_size = value.s3_multi_part_size.0 as usize;
         Self {
             prefix,
             temp_file_size_limit,
             temp_file_memory_quota,
             max_flush_interval,
+            s3_multi_part_size,
+            gcp_v2_enable: value.gcp_v2_enable,
         }
     }
 }
@@ -410,9 +415,13 @@ pub struct RouterInner {
     temp_file_memory_quota: AtomicU64,
     /// The max duration the local data can be pending.
     max_flush_interval: SyncRwLock<Duration>,
+    gcp_v2_enable: bool,
 
     /// Backup encryption manager
     backup_encryption_manager: BackupEncryptionManager,
+
+    /// S3 multi part size
+    s3_multi_part_size: AtomicUsize,
 }
 
 impl std::fmt::Debug for RouterInner {
@@ -439,7 +448,9 @@ impl RouterInner {
             temp_file_size_limit: AtomicU64::new(config.temp_file_size_limit),
             temp_file_memory_quota: AtomicU64::new(config.temp_file_memory_quota),
             max_flush_interval: SyncRwLock::new(config.max_flush_interval),
+            gcp_v2_enable: config.gcp_v2_enable,
             backup_encryption_manager,
+            s3_multi_part_size: AtomicUsize::new(config.s3_multi_part_size),
         }
     }
 
@@ -449,6 +460,8 @@ impl RouterInner {
             .store(config.file_size_limit.0, Ordering::SeqCst);
         self.temp_file_memory_quota
             .store(config.temp_file_memory_quota.0, Ordering::SeqCst);
+        self.s3_multi_part_size
+            .store(config.s3_multi_part_size.0 as usize, Ordering::SeqCst);
         for entry in self.tasks.iter() {
             entry
                 .temp_file_pool
@@ -510,14 +523,21 @@ impl RouterInner {
         let task_name = task.info.get_name().to_owned();
         // register task info
         let cfg = self.tempfile_config_for_task(&task);
+        let gcp_v2_enable = self.gcp_v2_enable;
         let backup_encryption_manager =
             self.build_backup_encryption_manager_for_task(&task).await?;
+        let backend_config = BackendConfig {
+            s3_multi_part_size: self.s3_multi_part_size.load(Ordering::Relaxed),
+            gcp_v2_enable,
+            hdfs_config: HdfsConfig::default(),
+        };
         let stream_task = StreamTaskHandler::new(
             task,
             ranges.clone(),
             merged_file_size_limit,
             cfg,
             backup_encryption_manager,
+            backend_config,
         )
         .await?;
         self.tasks.insert(task_name.clone(), Arc::new(stream_task));
@@ -996,13 +1016,11 @@ impl StreamTaskHandler {
         merged_file_size_limit: u64,
         temp_pool_cfg: tempfiles::Config,
         backup_encryption_manager: BackupEncryptionManager,
+        backend_config: BackendConfig,
     ) -> Result<Self> {
         let temp_dir = &temp_pool_cfg.swap_files;
         tokio::fs::create_dir_all(temp_dir).await?;
-        let storage = Arc::from(create_storage(
-            task.info.get_storage(),
-            BackendConfig::default(),
-        )?);
+        let storage = Arc::from(create_storage(task.info.get_storage(), backend_config)?);
         let start_ts = task.info.get_start_ts();
         Ok(Self {
             task,
@@ -2101,6 +2119,8 @@ mod tests {
                 temp_file_size_limit: 1024,
                 temp_file_memory_quota: 1024 * 2,
                 max_flush_interval: Duration::from_secs(300),
+                s3_multi_part_size: ReadableSize::mb(5).0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         );
@@ -2200,6 +2220,8 @@ mod tests {
                 temp_file_size_limit: 32,
                 temp_file_memory_quota: 32 * 2,
                 max_flush_interval: Duration::from_secs(300),
+                s3_multi_part_size: ReadableSize::mb(5).0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         );
@@ -2345,6 +2367,7 @@ mod tests {
             merged_file_size_limit,
             make_tempfiles_cfg(tmp_dir.path()),
             BackupEncryptionManager::default(),
+            BackendConfig::default(),
         )
         .await
         .unwrap();
@@ -2474,6 +2497,8 @@ mod tests {
                 temp_file_size_limit: 1,
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
+                s3_multi_part_size: ReadableSize::mb(5).0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         ));
@@ -2513,6 +2538,8 @@ mod tests {
                 temp_file_size_limit: 32,
                 temp_file_memory_quota: 32 * 2,
                 max_flush_interval: Duration::from_secs(300),
+                s3_multi_part_size: ReadableSize::mb(5).0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         );
@@ -2556,6 +2583,8 @@ mod tests {
                 temp_file_size_limit: 1,
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
+                s3_multi_part_size: ReadableSize::mb(5).0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         ));
@@ -2611,6 +2640,8 @@ mod tests {
                 temp_file_size_limit: 1,
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
+                s3_multi_part_size: ReadableSize::mb(5).0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         ));
@@ -2748,6 +2779,7 @@ mod tests {
             0x100000,
             make_tempfiles_cfg(tmp_dir.path()),
             backup_encryption_manager,
+            BackendConfig::default(),
         )
         .await
         .unwrap();
@@ -2905,6 +2937,8 @@ mod tests {
                 temp_file_size_limit: 1,
                 temp_file_memory_quota: 2,
                 max_flush_interval: cfg.max_flush_interval.0,
+                s3_multi_part_size: cfg.s3_multi_part_size.0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         ));
@@ -2962,6 +2996,8 @@ mod tests {
                 temp_file_size_limit: 1000,
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
+                s3_multi_part_size: ReadableSize::mb(5).0 as usize,
+                gcp_v2_enable: true,
             },
             BackupEncryptionManager::default(),
         ));
@@ -3114,6 +3150,7 @@ mod tests {
             merged_file_size_limit,
             make_tempfiles_cfg(tempfile::tempdir().unwrap().path()),
             backup_encryption_manager.clone(),
+            BackendConfig::default(),
         )
         .await
         .unwrap();
