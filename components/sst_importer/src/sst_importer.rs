@@ -22,8 +22,8 @@ use engine_traits::{
     CF_WRITE,
 };
 use external_storage::{
-    BackendConfig, ExternalStorage, RestoreConfig, compression_reader_dispatcher,
-    encrypt_wrap_reader, wrap_with_checksum_reader_if_needed,
+    compression_reader_dispatcher, encrypt_wrap_reader, wrap_with_checksum_reader_if_needed,
+    BackendConfig, ExternalStorage, RestoreConfig,
 };
 use file_system::{get_io_rate_limiter, IoType, OpenOptions};
 use kvproto::{
@@ -49,7 +49,6 @@ use tokio::{runtime::Runtime, sync::OnceCell};
 use txn_types::{Key, TimeStamp, WriteRef};
 
 use crate::{
-    Config, ConfigManager as ImportConfigManager, Error, Result,
     caching::{
         cache_map::{CacheMap, ShareOwned},
         storage_cache::StorageBackendFactory,
@@ -60,7 +59,7 @@ use crate::{
     metrics::*,
     sst_merge_iter::BinaryIterator,
     sst_writer::{RawSstWriter, TxnSstWriter},
-    util,
+    util, Config, ConfigManager as ImportConfigManager, Error, Result,
 };
 
 pub struct LoadedFile {

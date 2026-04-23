@@ -169,7 +169,7 @@ impl File {
     }
 
     pub fn lock_shared(&self) -> io::Result<()> {
-        self.inner.lock_shared()
+        fs2::FileExt::lock_shared(&self.inner)
     }
 
     pub fn lock_exclusive(&self) -> io::Result<()> {
@@ -177,7 +177,7 @@ impl File {
     }
 
     pub fn try_lock_shared(&self) -> io::Result<()> {
-        self.inner.try_lock_shared()
+        fs2::FileExt::try_lock_shared(&self.inner).map(|_| ())
     }
 
     pub fn try_lock_exclusive(&self) -> io::Result<()> {
@@ -185,7 +185,7 @@ impl File {
     }
 
     pub fn unlock(&self) -> io::Result<()> {
-        self.inner.unlock()
+        fs2::FileExt::unlock(&self.inner)
     }
 }
 
